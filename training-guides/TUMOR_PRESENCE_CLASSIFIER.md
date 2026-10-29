@@ -1,91 +1,121 @@
 # Train a tumor present/absent classifier
 
-This guide describes a scan-level classifier: give it one PET/CT study and it predicts whether the study contains at least one labeled lesion. Its output is one score for the entire scan. It does not locate or outline the lesion. For an output mask, use the [lesion segmentation guide](../FINE_TUNING_GUIDE.md) instead.
+This workflow trains a 3D model to return one prediction for each PET/CT study: **lesion present** or **lesion absent**. It does not produce a lesion mask. For voxel-by-voxel lesion locations, use the [segmentation guide](../FINE_TUNING_GUIDE.md).
 
-## What the model does
+## Requirements
 
-```text
-CT volume + PET volume
-        ↓
-align and preprocess both 3D volumes
-        ↓
-3D encoder (for example, ResNet-18)
-        ↓
-global pooling and a binary classification head
-        ↓
-probability: lesion present
+- AutoPET PET/CT training images and their lesion masks.
+- A Linux server with an NVIDIA GPU.
+- Python, a CUDA-compatible PyTorch installation, MONAI, and a NIfTI reader such as NiBabel.
+
+## 1. Set up the environment
+
+Create a Python environment and install PyTorch for the server's CUDA version. Then install MONAI and the NIfTI reader:
+
+```bash
+conda create -n autopet-classifier python=3.10 -y
+conda activate autopet-classifier
+# Install the PyTorch build that matches the server: https://pytorch.org/get-started/locally/
+pip install monai nibabel scikit-learn
 ```
 
-Use a model with two input channels, one for CT and one for PET, and one output logit. A 3D ResNet-18 implemented in [MONAI](https://monai.readthedocs.io/en/latest/networks.html) is a reasonable first architecture. The network is trained for binary classification; it is not the same nnU-Net model used in the segmentation guide.
+Check that PyTorch can use the GPU:
 
-## 1. Build one label per scan
+```bash
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available())"
+```
 
-AutoPET provides PET/CT studies and voxel-level lesion annotations. For each training study, make one binary label from its lesion mask:
+## 2. Make a case table
 
-- `1` if the labeled mask contains any foreground lesion voxels.
-- `0` if the labeled mask is present and contains no foreground voxels.
+Download the [AutoPET III training data](https://autopet-iii.grand-challenge.org/dataset/). Create one table row per study with these fields:
 
-Do not label a missing mask as negative. Confirm that the scan and mask belong to the same case, and that their image geometry matches. If the team uses FDG and PSMA cases, retain tracer and center information in the case table so results can be checked across groups.
+| case_id | ct_path | pet_path | mask_path | patient_id |
+|---|---|---|---|---|
+| case_001 | `imagesTr/case_001_0000.nii.gz` | `imagesTr/case_001_0001.nii.gz` | `labelsTr/case_001.nii.gz` | patient_001 |
 
-Create a table such as:
+In the usual nnU-Net naming convention, `_0000` is CT and `_0001` is PET. Check the dataset metadata and filenames before pairing the images and masks. Keep tracer and center metadata in the table when available.
 
-| case_id | ct_path | pet_path | mask_path | label | patient_id |
-|---|---|---|---|---:|---|
-| case_001 | `imagesTr/case_001_0000.nii.gz` | `imagesTr/case_001_0001.nii.gz` | `labelsTr/case_001.nii.gz` | 1 | patient_001 |
+## 3. Create the binary labels
 
-The usual nnU-Net channel suffixes are `_0000` for CT and `_0001` for PET. Verify the dataset's metadata and case naming before pairing files.
+For each study, read its lesion mask and create one label:
 
-## 2. Split the cases
+- `1` when the mask contains one or more foreground lesion voxels.
+- `0` when a valid mask is present and contains no foreground voxels.
 
-Make training, validation, and test splits by patient, before generating patches or augmented copies. Keep every scan from the same patient in one split to avoid leakage. Preserve both positive and negative cases in each split where possible. If the class counts are uneven, use a stratified split and report the counts.
+Do not treat a missing mask as a negative case. Confirm that each mask belongs to its paired scan and has matching image geometry. AutoPET provides voxel-level lesion annotations, which can be converted to these scan-level labels.
 
-Use the validation split to choose a probability threshold. Keep the test split untouched until the final evaluation. Do not use the test results to tune preprocessing, the threshold, or the model.
+## 4. Split cases into train, validation, and test sets
 
-## 3. Preprocess the volumes
+1. Split by patient before making augmented copies or patches.
+2. Keep every study from the same patient in only one split.
+3. Preserve positive and negative cases in each split when possible; record the counts.
+4. Use the validation set to select the decision threshold and model checkpoint.
+5. Use the test set once for final evaluation. Do not tune the model or preprocessing using test results.
 
-For each case:
+Use a stratified split if class counts are uneven. Do not randomly split slices from the same scan across different sets.
 
-1. Load the CT, PET, and mask from NIfTI and check their affine matrices, spacing, and dimensions.
-2. Resample CT and PET to the same voxel grid, using the case geometry. Use linear interpolation for image intensities and nearest-neighbor interpolation for masks.
-3. Apply consistent modality-specific scaling. For example, clip CT to a chosen Hounsfield-unit range and scale it; scale PET using a documented range or robust per-volume statistics. Decide the values using training data, then apply the same rule to validation and test.
-4. Crop/pad or resample the whole body to a fixed input shape so examples can be batched. Record the target spacing and shape; check that small lesions remain represented.
-5. Add realistic 3D augmentations to training examples only, such as small rotations, flips when anatomically appropriate, and intensity changes. Do not augment validation or test examples.
+## 5. Preprocess each PET/CT study
 
-Keep PET and CT together as the two channels of one case. Avoid training on a random set of isolated slices as if they were independent patients; that can leak patient-specific anatomy across splits and discard 3D context.
+1. Load CT, PET, and mask volumes from NIfTI.
+2. Check their affine matrices, spacing, and dimensions. Resample CT and PET onto the same voxel grid if needed.
+3. Use linear interpolation for image intensities and nearest-neighbor interpolation for masks.
+4. Apply consistent intensity scaling by modality. For example, clip and scale CT values, and scale PET using a documented range or robust per-volume statistics. Set the rules using training data and apply the same rules to validation and test.
+5. Crop/pad or resample the whole-body volumes to one fixed shape. Record the target spacing and shape, and check that small lesions remain visible.
+6. Apply 3D augmentation to training cases only. Possible augmentations include small rotations and intensity changes; use flips only when appropriate for the study.
 
-## 4. Train a baseline
+Keep CT and PET as two channels of the same model input. Do not treat slices from one patient as separate independent examples.
 
-Use a 3D ResNet-18 with two input channels and one output logit. A typical training setup is:
+## 6. Define the classifier
 
-- Loss: `BCEWithLogitsLoss`; consider a positive-class weight if the training set is imbalanced.
-- Optimizer: AdamW with a modest learning rate, such as `1e-4`, and weight decay.
-- Batch size: the largest batch that fits the server GPU; 3D volumes can use a lot of memory.
-- Checkpoint: save the model with the best validation performance, not just the final epoch.
-- Reproducibility: record the split, preprocessing settings, random seed, package versions, and model configuration.
+Use a 3D ResNet-18 with two input channels and one output logit. A MONAI implementation can be initialized as follows:
 
-Begin with a small run to confirm that cases load, labels are correct, and loss decreases. Then train using the full training split. The current `classifier.ipynb` in this repository is a majority-class baseline and does not yet implement this 3D workflow.
+```python
+from monai.networks.nets import resnet18
+
+model = resnet18(
+    spatial_dims=3,
+    n_input_channels=2,  # CT and PET
+    num_classes=1,       # one logit for present vs absent
+)
+```
+
+The output logit is converted to a probability with a sigmoid during evaluation. This is a scan-level classifier, separate from the nnU-Net lesion segmentation model.
+
+## 7. Train the model
+
+Use the training split to update model weights and the validation split to choose the best checkpoint. A starting configuration is:
+
+- Loss: `BCEWithLogitsLoss`; add a positive-class weight if the training cases are imbalanced.
+- Optimizer: AdamW with learning rate around `1e-4` and weight decay.
+- Batch size: set to what fits in GPU memory for the selected 3D volume shape.
+- Checkpoint selection: save the model with the best validation score, not only the last epoch.
+- Run record: save the random seed, split, preprocessing, model settings, and package versions.
+
+Start with a short run to check loading, labels, and loss updates. Then train on the full training split. The existing `classifier.ipynb` in this repository is a majority-class baseline; it does not yet implement this 3D training workflow.
 
 ### Pretrained weights
 
-The ResEncL checkpoint described in the segmentation guide is for a particular nnU-Net segmentation architecture. It cannot be dropped directly into a MONAI ResNet classifier. A later experiment could reuse a compatible pretrained 3D encoder, but it needs matching architecture and a deliberate weight-loading step. For the first classification baseline, use the same 3D classifier architecture throughout and document whether it starts from random initialization or compatible pretrained weights.
+The ResEncL checkpoint in the segmentation guide belongs to a specific nnU-Net segmentation architecture. Its weights cannot be loaded directly into the MONAI ResNet-18 classifier. Reusing a pretrained encoder requires a matching architecture and an explicit weight-loading step. For the first classifier baseline, train this classifier from its initial weights and record that choice.
 
-## 5. Evaluate the classifier
+## 8. Evaluate the model
 
-Report more than accuracy, especially if positive and negative case counts differ:
+1. Select a probability threshold using validation predictions.
+2. Calculate ROC-AUC and precision-recall AUC.
+3. At the selected threshold, report sensitivity, specificity, balanced accuracy, and a confusion matrix.
+4. Include the number of positive and negative cases in each split.
+5. If the dataset includes multiple tracers or centers, report results for those groups as well as the overall result.
+6. Run the final evaluation on the held-out test set.
 
-- ROC-AUC and precision-recall AUC.
-- Sensitivity (recall) and specificity at the selected threshold.
-- Confusion matrix and balanced accuracy.
-- The number of positive and negative cases in each split.
+Scan-level accuracy does not show whether the model located a lesion. Use segmentation metrics to evaluate lesion locations.
 
-Select the threshold on the validation set based on the project's priorities, then evaluate once on the held-out test set. Include per-tracer or per-center results if the dataset contains those groups. A high scan-level classification score does not show that the model found the lesion location; only segmentation evaluation can assess that.
+## 9. Save the model and run predictions
 
-## 6. Save and use the result
-
-Save the trained model weights, input shape, voxel spacing, intensity scaling rules, threshold, and class mapping together. At inference, apply the same preprocessing to a new CT/PET pair and report the probability and the chosen present/absent decision. Keep the case ID linked to the output so predictions can be checked against the source study.
+Save the model weights together with the input shape, voxel spacing, intensity scaling rules, threshold, and class mapping. For each new study, apply the same preprocessing, run the model, apply sigmoid to its logit, and compare the probability to the saved threshold. Save the case ID, probability, and present/absent decision.
 
 ## References
 
-- [AutoPET III dataset and challenge description](https://autopet.org/autopetiii.html)
+- [AutoPET III dataset and challenge description](https://autopet-iii.grand-challenge.org/dataset/)
+- [AutoPET III dataset information](https://autopet.org/autopetiii.html)
 - [AutoPET III team code and dataset-format examples](https://github.com/ClinicalDataScience/autoPETIII)
 - [MONAI network documentation](https://monai.readthedocs.io/en/latest/networks.html)
