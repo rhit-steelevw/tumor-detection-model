@@ -2,3 +2,28 @@
 __pycache__/
 *.pyc
 checkpoints/
+
+# Slurm logs
+
+*.out
+
+# Large data / generated features (adjust as needed)
+
+data/
+
+features/
+
+# Slurm logs
+*.out
+# autoPET data, preprocessing, and weights (1.4 TB — keep on cluster)
+autopet/nnUNet_raw/
+autopet/nnUNet_preprocessed/
+autopet/nnUNet_results/
+autopet/pretrained/
+autopet/download/
+# general safety net
+*.nii.gz
+*.npy
+*.npz
+*.pth
+*.zip
